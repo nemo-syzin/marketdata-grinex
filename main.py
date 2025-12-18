@@ -1,3 +1,4 @@
+# main.py
 import asyncio
 import json
 import logging
@@ -13,41 +14,46 @@ import certifi
 import httpx
 
 try:
-    # Python 3.9+
-    from zoneinfo import ZoneInfo
+    from zoneinfo import ZoneInfo  # py3.9+
 except Exception:
     ZoneInfo = None  # type: ignore
 
 
-# ───────────────────────── CONFIG ─────────────────────────
-
-BASE_URL = os.getenv("GRINEX_BASE_URL", "https://grinex.io").rstrip("/")
-MARKET = os.getenv("GRINEX_MARKET", "usdta7a5")  # grinex market id
-LIMIT = int(os.getenv("GRINEX_LIMIT", "200"))     # window size from API (keep with запасом)
-POLL_SECONDS = float(os.getenv("GRINEX_POLL_SECONDS", "1.5"))
-
-SOURCE = os.getenv("SOURCE", "grinex")
-# Для usdta7a5 логично считать, что quote ~ RUB-эквивалент, поэтому SYMBOL по умолчанию USDT/RUB.
-SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
-
-# Таймзона для trade_time (time without tz в БД). Держи так же, как у Rapira.
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+# ───────────────────────── ENV (как на твоём скрине) ─────────────────────────
+# Обязательные в Render:
+#   SUPABASE_URL, SUPABASE_KEY, SUPABASE_TABLE
+#   LIMIT, POLL_SEC
+# Необязательные:
+#   ABCEX_EMAIL, ABCEX_PASSWORD (не используются этим воркером)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
+LIMIT = int(os.getenv("LIMIT", "800"))          # окно сделок за один запрос
+POLL_SEC = float(os.getenv("POLL_SEC", "1.0"))  # период опроса
+
+# ───────────────────────── GRINEX CONFIG ─────────────────────────
+BASE_URL = os.getenv("GRINEX_BASE_URL", "https://grinex.io").rstrip("/")
+MARKET = os.getenv("GRINEX_MARKET", "usdta7a5")  # рынок Grinex
+SOURCE = os.getenv("SOURCE", "grinex")
+SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
+
+# time without tz в БД — приводим к Москве (как у Rapira)
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+
 # Должно совпадать с твоим unique index:
+# create unique index ... (source, symbol, trade_time, price, volume_usdt)
 ON_CONFLICT = os.getenv("ON_CONFLICT", "source,symbol,trade_time,price,volume_usdt")
 
-# Локальная память от дублей/переупорядочивания
-SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
+# локальная память ключей (чтобы не слать одно и то же в Supabase по кругу)
+SEEN_MAX = int(os.getenv("SEEN_MAX", "30000"))
 
-# Heartbeat, чтобы воркер не “молчал”
-HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "30"))
-
-# Ограничение размера батча на вставку
+# батч вставки
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "500"))
+
+# heartbeat чтобы воркер “не молчал”
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "30"))
 
 TRADES_URL = f"{BASE_URL}/api/v2/trades?market={MARKET}&limit={LIMIT}&order_by=desc"
 
@@ -55,20 +61,15 @@ HEADERS = {
     "User-Agent": os.getenv(
         "UA",
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": f"{BASE_URL}/trading/{MARKET}?lang=ru",
 }
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
 logger = logging.getLogger("grinex-worker")
-
-# глушим шум httpx вида "HTTP Request: ..."
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -76,11 +77,8 @@ Q8 = Decimal("0.00000001")
 
 
 # ───────────────────────── TYPES ─────────────────────────
-
 @dataclass(frozen=True)
 class TradeKey:
-    # ключ для локальной дедупликации
-    # (в БД дедуп по ON_CONFLICT, тут — чтобы не слать одно и то же 100 раз)
     tid: Optional[str]
     trade_time: str
     price: str
@@ -88,24 +86,7 @@ class TradeKey:
 
 
 # ───────────────────────── HELPERS ─────────────────────────
-
-def _as_decimal(x: Any) -> Optional[Decimal]:
-    try:
-        if x is None:
-            return None
-        s = str(x).strip().replace(",", ".").replace(" ", "")
-        if not s:
-            return None
-        return Decimal(s)
-    except (InvalidOperation, ValueError):
-        return None
-
-
-def q8_str(x: Decimal) -> str:
-    return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
-
-
-def _tzinfo() -> timezone:
+def _tzinfo():
     if ZoneInfo is None:
         return timezone.utc
     try:
@@ -117,27 +98,51 @@ def _tzinfo() -> timezone:
 TZ = _tzinfo()
 
 
+def _as_decimal(x: Any) -> Optional[Decimal]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip().replace("\xa0", " ").replace(" ", "").replace(",", ".")
+        if not s:
+            return None
+        return Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def q8_str(x: Decimal) -> str:
+    return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
+
+
+def _get_tid(obj: Dict[str, Any]) -> Optional[str]:
+    for k in ("id", "tid", "trade_id", "tradeId"):
+        v = obj.get(k)
+        if v is not None:
+            return str(v)
+    return None
+
+
 def _parse_ts(obj: Dict[str, Any]) -> datetime:
     """
-    Grinex/подобные движки могут отдавать:
-    - created_at ISO
-    - timestamp в сек/мс
+    Пытаемся вытащить время сделки из разных возможных полей.
+    Возвращаем datetime в UTC.
     """
-    for k in ("created_at", "timestamp", "ts", "time", "at", "date"):
+    for k in ("created_at", "createdAt", "timestamp", "ts", "time", "at", "date"):
         v = obj.get(k)
         if v is None:
             continue
 
+        # число: sec или ms
         if isinstance(v, (int, float)):
             sec = float(v) / 1000.0 if v > 10_000_000_000 else float(v)
             return datetime.fromtimestamp(sec, tz=timezone.utc)
 
+        # строка ISO
         if isinstance(v, str):
             s = v.strip()
             try:
                 if s.endswith("Z"):
                     s = s[:-1] + "+00:00"
-                # fromisoformat умеет "+00:00"
                 dt = datetime.fromisoformat(s)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
@@ -152,32 +157,36 @@ def _extract_trades(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
     if isinstance(payload, dict):
-        for k in ("trades", "data", "result"):
+        for k in ("trades", "data", "result", "items"):
             v = payload.get(k)
             if isinstance(v, list):
                 return [x for x in v if isinstance(x, dict)]
     return []
 
 
-def _get_tid(obj: Dict[str, Any]) -> Optional[str]:
-    for k in ("id", "tid", "trade_id"):
-        v = obj.get(k)
-        if v is not None:
-            return str(v)
-    return None
-
-
 def normalize_trade(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Приводит сырой trade к формату таблицы exchange_trades:
+    Приводим trade к формату таблицы exchange_trades:
       source, symbol, price, volume_usdt, volume_rub, trade_time
     """
+    # price
     price = _as_decimal(obj.get("price"))
-    amount = _as_decimal(obj.get("amount")) or _as_decimal(obj.get("volume"))   # base (USDT)
+
+    # base amount (USDT)
+    amount = (
+        _as_decimal(obj.get("amount"))
+        or _as_decimal(obj.get("volume"))
+        or _as_decimal(obj.get("qty"))
+        or _as_decimal(obj.get("quantity"))
+    )
+
+    # quote total (RUB-эквивалент)
     total = (
         _as_decimal(obj.get("total"))
         or _as_decimal(obj.get("funds"))
+        or _as_decimal(obj.get("cost"))
         or _as_decimal(obj.get("quote_volume"))
+        or _as_decimal(obj.get("quoteVolume"))
     )
 
     if price is None or amount is None:
@@ -198,10 +207,10 @@ def normalize_trade(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "symbol": SYMBOL,
         "price": q8_str(price),
         "volume_usdt": q8_str(amount),
-        # ВАЖНО: в твоей схеме volume_rub NOT NULL — пишем total как RUB-эквивалент.
         "volume_rub": q8_str(total),
         "trade_time": trade_time,
-        "_tid": _get_tid(obj),   # внутреннее поле для локального seen
+        "_tid": _get_tid(obj),
+        "_ts": ts_utc.timestamp(),  # для сортировки (внутреннее)
     }
 
 
@@ -217,11 +226,10 @@ def make_key(row: Dict[str, Any]) -> TradeKey:
 def chunked(xs: List[Dict[str, Any]], n: int) -> List[List[Dict[str, Any]]]:
     if n <= 0:
         return [xs]
-    return [xs[i:i + n] for i in range(0, len(xs), n)]
+    return [xs[i : i + n] for i in range(0, len(xs), n)]
 
 
 # ───────────────────────── SUPABASE ─────────────────────────
-
 async def supabase_upsert(client: httpx.AsyncClient, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
@@ -238,9 +246,7 @@ async def supabase_upsert(client: httpx.AsyncClient, rows: List[Dict[str, Any]])
         "Prefer": "resolution=ignore-duplicates,return=minimal",
     }
 
-    # удаляем внутренние поля
     payload = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-
     r = await client.post(url, headers=headers, params=params, json=payload)
     if r.status_code >= 300:
         logger.error("Supabase upsert failed (%s): %s", r.status_code, r.text)
@@ -248,8 +254,51 @@ async def supabase_upsert(client: httpx.AsyncClient, rows: List[Dict[str, Any]])
         logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(payload), SUPABASE_TABLE)
 
 
-# ───────────────────────── FETCH ─────────────────────────
+async def preload_seen_from_supabase(client: httpx.AsyncClient, preload_limit: int = 2000) -> List[TradeKey]:
+    """
+    Чтобы после рестарта не спамить повторными upsert'ами.
+    Таблица у тебя содержит created_at, поэтому сортируем по нему.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
 
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
+    params = {
+        "select": "trade_time,price,volume_usdt",
+        "source": f"eq.{SOURCE}",
+        "symbol": f"eq.{SYMBOL}",
+        "order": "created_at.desc",
+        "limit": str(preload_limit),
+    }
+
+    r = await client.get(url, headers=headers, params=params)
+    if r.status_code >= 300:
+        logger.warning("Preload failed (%s): %s", r.status_code, r.text[:200])
+        return []
+
+    out: List[TradeKey] = []
+    try:
+        data = r.json()
+        if isinstance(data, list):
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                tt = row.get("trade_time")
+                pr = row.get("price")
+                vu = row.get("volume_usdt")
+                if tt and pr and vu:
+                    out.append(TradeKey(tid=None, trade_time=str(tt), price=str(pr), volume_usdt=str(vu)))
+    except Exception:
+        return []
+
+    return out
+
+
+# ───────────────────────── FETCH ─────────────────────────
 async def fetch_window(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     resp = await client.get(TRADES_URL)
     resp.raise_for_status()
@@ -263,44 +312,48 @@ async def fetch_window(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
         if row:
             out.append(row)
 
-    # обычно API отдаёт desc, но не всегда; сортируем по времени (как строка HH:MM:SS недостаточно)
-    # поэтому сортируем по parsed ts, если есть created_at/timestamp. Для этого перепарсим ещё раз:
-    def _ts_sort_key(r: Dict[str, Any]) -> float:
-        # если tid есть — не поможет; берём created_at/timestamp из сырья нельзя (мы их уже потеряли),
-        # поэтому оставляем как есть; в итоге порядок будет "как пришло".
-        return 0.0
-
+    # сортируем по _ts, чтобы вставлять строго от старых к новым
+    out.sort(key=lambda r: float(r.get("_ts", 0.0)))
     return out
 
 
-# ───────────────────────── WORKER LOOP ─────────────────────────
-
+# ───────────────────────── WORKER ─────────────────────────
 async def worker() -> None:
     seen: Set[TradeKey] = set()
     seen_q: Deque[TradeKey] = deque(maxlen=SEEN_MAX)
 
     backoff = 2.0
     last_heartbeat = 0.0
+    started = time.time()
 
     async with httpx.AsyncClient(
         headers=HEADERS,
-        timeout=15,
+        timeout=httpx.Timeout(15.0, connect=10.0),
         follow_redirects=True,
         verify=certifi.where(),
-        trust_env=True,  # если на Render задашь прокси через env — подхватится
+        trust_env=True,
     ) as client:
+
+        # preload
+        try:
+            pre = await preload_seen_from_supabase(client, preload_limit=2000)
+            for k in pre:
+                seen.add(k)
+                seen_q.append(k)
+            logger.info("Preloaded %d recent keys from Supabase | seen=%d", len(pre), len(seen))
+        except Exception as e:
+            logger.warning("Preload skipped: %s", e)
+
         while True:
             t0 = time.time()
             try:
                 window = await fetch_window(client)
 
                 if not window:
-                    logger.warning("Empty window from API. url=%s", TRADES_URL)
+                    logger.warning("Empty/invalid window from API. url=%s", TRADES_URL)
                 else:
-                    # API обычно "новые сверху". Чтобы корректнее писать в БД: старые -> новые
-                    # (для аналитики по времени это удобнее)
                     new_rows: List[Dict[str, Any]] = []
-                    for row in reversed(window):
+                    for row in window:  # уже отсортировано старые -> новые
                         k = make_key(row)
                         if k in seen:
                             continue
@@ -308,13 +361,14 @@ async def worker() -> None:
                         seen.add(k)
                         seen_q.append(k)
 
-                    # если deque переполняется, set может разъехаться — пересоберём
-                    if len(seen) > len(seen_q) + 200:
+                    # защита от рассинхронизации set/deque (редко)
+                    if len(seen) > len(seen_q) + 500:
                         seen = set(seen_q)
 
                     if new_rows:
                         newest = {k: v for k, v in new_rows[-1].items() if not k.startswith("_")}
                         logger.info("Parsed %d new trades. Newest: %s", len(new_rows), json.dumps(newest, ensure_ascii=False))
+
                         for batch in chunked(new_rows, UPSERT_BATCH):
                             await supabase_upsert(client, batch)
                     else:
@@ -324,14 +378,14 @@ async def worker() -> None:
                 now = time.time()
                 if now - last_heartbeat >= HEARTBEAT_SEC:
                     logger.info(
-                        "Heartbeat: alive | market=%s | poll=%.2fs | window=%d | seen=%d",
-                        MARKET, POLL_SECONDS, len(window), len(seen)
+                        "Heartbeat: alive | market=%s | poll=%.2fs | limit=%d | window=%d | seen=%d | uptime=%.0fs",
+                        MARKET, POLL_SEC, LIMIT, len(window), len(seen), now - started
                     )
                     last_heartbeat = now
 
                 backoff = 2.0
                 dt = time.time() - t0
-                sleep_s = max(0.3, POLL_SECONDS - dt)
+                sleep_s = max(0.25, POLL_SEC - dt)
                 await asyncio.sleep(sleep_s)
 
             except Exception as e:
