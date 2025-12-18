@@ -2,8 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import random
-import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -13,76 +11,67 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import certifi
 import httpx
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
-# ───────────────────────── ENV (как на скрине) ─────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
+try:
+    # Python 3.9+
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # type: ignore
 
-LIMIT = int(os.getenv("LIMIT", "200"))          # окно сделок
-POLL_SEC = float(os.getenv("POLL_SEC", "2.0"))  # период опроса (сек)
 
-# Эти переменные у тебя есть в env, но они этому воркеру не нужны:
-_ABCEX_EMAIL = os.getenv("ABCEX_EMAIL", "")
-_ABCEX_PASSWORD = os.getenv("ABCEX_PASSWORD", "")
+# ───────────────────────── ENV / CONFIG ─────────────────────────
 
-# ───────────────────────── GRINEX CONFIG ─────────────────────────
 BASE_URL = os.getenv("GRINEX_BASE_URL", "https://grinex.io").rstrip("/")
 MARKET = os.getenv("GRINEX_MARKET", "usdta7a5")
+LIMIT = int(os.getenv("GRINEX_LIMIT", "200"))  # окно сделок с запасом
+POLL_SEC = float(os.getenv("GRINEX_POLL_SEC", "2.0"))
 
 SOURCE = os.getenv("SOURCE", "grinex")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
-# Должно совпадать с unique index в Supabase:
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Moscow")  # чтобы trade_time был как у Rapira (HH:MM:SS)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 ON_CONFLICT = os.getenv("ON_CONFLICT", "source,symbol,trade_time,price,volume_usdt")
 
-# локальная дедупликация (чтобы не слать одно и то же постоянно)
-SEEN_MAX = int(os.getenv("SEEN_MAX", "30000"))
+SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "500"))
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "30"))
 
-# если хочешь полностью запретить runtime install — поставь 1
-SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
-
-# сколько подряд не-JSON/ошибок нужно, чтобы включить playwright fallback
-NON_JSON_BEFORE_FALLBACK = int(os.getenv("NON_JSON_BEFORE_FALLBACK", "2"))
-
 TRADES_URL = f"{BASE_URL}/api/v2/trades?market={MARKET}&limit={LIMIT}&order_by=desc"
-TRADING_PAGE_URL = f"{BASE_URL}/trading/{MARKET}?lang=ru"
-
-UA = os.getenv(
-    "UA",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-)
 
 HEADERS = {
-    "User-Agent": UA,
+    "User-Agent": os.getenv(
+        "UA",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": TRADING_PAGE_URL,
+    "Referer": f"{BASE_URL}/trading/{MARKET}?lang=ru",
 }
+
+
+# ───────────────────────── LOGGING ─────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
 logger = logging.getLogger("grinex-worker")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+
+# ───────────────────────── NUMERIC HELPERS ─────────────────────────
+
 Q8 = Decimal("0.00000001")
 
 
-# ───────────────────────── TYPES ─────────────────────────
-@dataclass(frozen=True)
-class TradeKey:
-    tid: Optional[str]
-    trade_time: str
-    price: str
-    volume_usdt: str
+def q8_str(x: Decimal) -> str:
+    return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
 
 
-# ───────────────────────── HELPERS ─────────────────────────
-def _as_decimal(x: Any) -> Optional[Decimal]:
+def as_decimal(x: Any) -> Optional[Decimal]:
     try:
         if x is None:
             return None
@@ -94,20 +83,25 @@ def _as_decimal(x: Any) -> Optional[Decimal]:
         return None
 
 
-def q8_str(x: Decimal) -> str:
-    return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
+# ───────────────────────── TIME HELPERS ─────────────────────────
+
+def tzinfo() -> timezone:
+    if ZoneInfo is None:
+        return timezone.utc
+    try:
+        return ZoneInfo(TIMEZONE_NAME)  # type: ignore
+    except Exception:
+        return timezone.utc
 
 
-def _get_tid(obj: Dict[str, Any]) -> Optional[str]:
-    for k in ("id", "tid", "trade_id", "tradeId"):
-        v = obj.get(k)
-        if v is not None:
-            return str(v)
-    return None
+TZ = tzinfo()
 
 
-def _parse_ts(obj: Dict[str, Any]) -> datetime:
-    for k in ("created_at", "createdAt", "timestamp", "ts", "time", "at", "date"):
+def parse_ts(obj: Dict[str, Any]) -> datetime:
+    """
+    Grinex может отдавать created_at ISO или timestamp (sec/ms).
+    """
+    for k in ("created_at", "timestamp", "ts", "time", "at", "date"):
         v = obj.get(k)
         if v is None:
             continue
@@ -131,36 +125,51 @@ def _parse_ts(obj: Dict[str, Any]) -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _extract_trades(payload: Any) -> List[Dict[str, Any]]:
+# ───────────────────────── MODEL / DEDUPE ─────────────────────────
+
+@dataclass(frozen=True)
+class TradeKey:
+    tid: Optional[str]
+    ts_epoch: int
+    price: str
+    amount: str
+
+
+def extract_tid(obj: Dict[str, Any]) -> Optional[str]:
+    for k in ("id", "tid", "trade_id"):
+        v = obj.get(k)
+        if v is not None:
+            return str(v)
+    return None
+
+
+def make_key(tid: Optional[str], ts_utc: datetime, price_s: str, amount_s: str) -> TradeKey:
+    return TradeKey(tid=tid, ts_epoch=int(ts_utc.timestamp()), price=price_s, amount=amount_s)
+
+
+def extract_trades(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
     if isinstance(payload, dict):
-        for k in ("trades", "data", "result", "items"):
+        for k in ("trades", "data", "result"):
             v = payload.get(k)
             if isinstance(v, list):
                 return [x for x in v if isinstance(x, dict)]
     return []
 
 
-def normalize_trade(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def normalize_trade(obj: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], TradeKey]]:
     """
-    Приводит trade к схеме exchange_trades:
-      source, symbol, price, volume_usdt, volume_rub, trade_time
-    trade_time — только HH:MM:SS (как у Rapira).
+    Возвращает:
+      row для Supabase (source,symbol,price,volume_usdt,volume_rub,trade_time)
+      + TradeKey для локальной дедупликации
     """
-    price = _as_decimal(obj.get("price"))
-    amount = (
-        _as_decimal(obj.get("amount"))
-        or _as_decimal(obj.get("volume"))
-        or _as_decimal(obj.get("qty"))
-        or _as_decimal(obj.get("quantity"))
-    )
+    price = as_decimal(obj.get("price"))
+    amount = as_decimal(obj.get("amount")) or as_decimal(obj.get("volume"))
     total = (
-        _as_decimal(obj.get("total"))
-        or _as_decimal(obj.get("funds"))
-        or _as_decimal(obj.get("cost"))
-        or _as_decimal(obj.get("quote_volume"))
-        or _as_decimal(obj.get("quoteVolume"))
+        as_decimal(obj.get("total"))
+        or as_decimal(obj.get("funds"))
+        or as_decimal(obj.get("quote_volume"))
     )
 
     if price is None or amount is None:
@@ -171,49 +180,36 @@ def normalize_trade(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if price <= 0 or amount <= 0 or total <= 0:
         return None
 
-    ts_utc = _parse_ts(obj)
-    # Важно: в БД у тебя time without tz, поэтому пишем время в МСК (как у Rapira).
-    # Если нужно другое — меняй на UTC или свою TZ и синхронизируй с Rapira.
-    trade_time = ts_utc.astimezone(timezone.utc).astimezone(
-        timezone(datetime.now().astimezone().utcoffset() or timezone.utc.utcoffset(datetime.now()))
-    )
-    # На практике проще фиксировать Moscow offset: но для прод лучше оставим UTC->local не надо.
-    # Поэтому делаем так: возьмём время по UTC+3 (Москва) жёстко:
-    moscow = timezone.utc if False else timezone(timezone.utc.utcoffset(ts_utc) or timezone.utc.utcoffset(ts_utc))
-    # Однако выше бессмысленно — оставим корректно: Moscow offset +03:00:
-    moscow = timezone(timedelta(hours=3))  # type: ignore  # noqa
+    ts_utc = parse_ts(obj)
+    trade_time = ts_utc.astimezone(TZ).strftime("%H:%M:%S")  # time-only как у Rapira
 
-    trade_time_str = ts_utc.astimezone(moscow).strftime("%H:%M:%S")
+    price_s = q8_str(price)
+    amount_s = q8_str(amount)
+    total_s = q8_str(total)
 
-    return {
+    tid = extract_tid(obj)
+    key = make_key(tid, ts_utc, price_s, amount_s)
+
+    row = {
         "source": SOURCE,
         "symbol": SYMBOL,
-        "price": q8_str(price),
-        "volume_usdt": q8_str(amount),
-        "volume_rub": q8_str(total),
-        "trade_time": trade_time_str,
-        "_tid": _get_tid(obj),
-        "_ts": ts_utc.timestamp(),
+        "price": price_s,
+        "volume_usdt": amount_s,
+        "volume_rub": total_s,      # в твоей схеме volume_rub NOT NULL
+        "trade_time": trade_time,   # time-only
     }
+    return row, key
 
 
-def make_key(row: Dict[str, Any]) -> TradeKey:
-    return TradeKey(
-        tid=row.get("_tid"),
-        trade_time=row["trade_time"],
-        price=row["price"],
-        volume_usdt=row["volume_usdt"],
-    )
-
-
-def chunked(xs: List[Dict[str, Any]], n: int) -> List[List[Dict[str, Any]]]:
+def chunked(rows: List[Dict[str, Any]], n: int) -> List[List[Dict[str, Any]]]:
     if n <= 0:
-        return [xs]
-    return [xs[i : i + n] for i in range(0, len(xs), n)]
+        return [rows]
+    return [rows[i:i + n] for i in range(0, len(rows), n)]
 
 
-# ───────────────────────── SUPABASE ─────────────────────────
-async def supabase_upsert(client: httpx.AsyncClient, rows: List[Dict[str, Any]]) -> None:
+# ───────────────────────── HTTP / SUPABASE ─────────────────────────
+
+async def supabase_upsert(sb: httpx.AsyncClient, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -229,261 +225,110 @@ async def supabase_upsert(client: httpx.AsyncClient, rows: List[Dict[str, Any]])
         "Prefer": "resolution=ignore-duplicates,return=minimal",
     }
 
-    payload = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-    r = await client.post(url, headers=headers, params=params, json=payload)
+    r = await sb.post(url, headers=headers, params=params, json=rows)
     if r.status_code >= 300:
-        logger.error("Supabase upsert failed (%s): %s", r.status_code, r.text)
+        logger.error("Supabase upsert failed (%s): %s", r.status_code, r.text[:500])
     else:
-        logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(payload), SUPABASE_TABLE)
+        logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
 
 
-async def preload_seen_from_supabase(client: httpx.AsyncClient, preload_limit: int = 1500) -> List[TradeKey]:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return []
+async def fetch_window(api: httpx.AsyncClient) -> List[Tuple[Dict[str, Any], TradeKey]]:
+    r = await api.get(TRADES_URL)
 
-    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    params = {
-        "select": "trade_time,price,volume_usdt",
-        "source": f"eq.{SOURCE}",
-        "symbol": f"eq.{SYMBOL}",
-        "order": "created_at.desc",
-        "limit": str(preload_limit),
-    }
-
-    r = await client.get(url, headers=headers, params=params)
-    if r.status_code >= 300:
-        logger.warning("Preload failed (%s): %s", r.status_code, r.text[:200])
-        return []
-
-    out: List[TradeKey] = []
-    try:
-        data = r.json()
-        if isinstance(data, list):
-            for row in data:
-                if not isinstance(row, dict):
-                    continue
-                tt = row.get("trade_time")
-                pr = row.get("price")
-                vu = row.get("volume_usdt")
-                if tt and pr and vu:
-                    out.append(TradeKey(tid=None, trade_time=str(tt), price=str(pr), volume_usdt=str(vu)))
-    except Exception:
-        return []
-    return out
-
-
-# ───────────────────────── HTTP FETCH (основной) ─────────────────────────
-async def fetch_window_httpx(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    r = await client.get(TRADES_URL)
+    # Если иногда вместо JSON прилетает HTML/пусто (Cloudflare/ограничения) —
+    # это место даст понятный лог, а не просто "Expecting value..."
     ct = (r.headers.get("content-type") or "").lower()
-    text = r.text or ""
-
     if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code}; ct={ct}; body={text[:200]!r}")
-
-    if "application/json" not in ct:
-        # на Render часто так выглядит Cloudflare/HTML
-        raise RuntimeError(f"Non-JSON response; ct={ct}; body={text[:200]!r}")
+        logger.warning("Grinex HTTP %s | ct=%s | body=%s", r.status_code, ct, r.text[:200])
+        r.raise_for_status()
 
     try:
         payload = r.json()
     except Exception:
-        raise RuntimeError(f"JSON decode failed; ct={ct}; body={text[:200]!r}")
+        logger.warning("Non-JSON response from Grinex | HTTP %s | ct=%s | body=%s", r.status_code, ct, r.text[:300])
+        raise
 
-    raw = _extract_trades(payload)
-    out: List[Dict[str, Any]] = []
+    raw = extract_trades(payload)
+
+    out: List[Tuple[Dict[str, Any], TradeKey]] = []
     for obj in raw:
-        row = normalize_trade(obj)
-        if row:
-            out.append(row)
+        norm = normalize_trade(obj)
+        if norm:
+            out.append(norm)
 
-    out.sort(key=lambda x: float(x.get("_ts", 0.0)))
     return out
-
-
-# ───────────────────────── PLAYWRIGHT FALLBACK ─────────────────────────
-def playwright_install() -> None:
-    if SKIP_BROWSER_INSTALL:
-        logger.info("SKIP_BROWSER_INSTALL=1, skipping playwright install.")
-        return
-    logger.warning("Installing Playwright browsers (runtime)...")
-    r = subprocess.run(
-        ["python", "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        logger.error("playwright install failed (%s)\nSTDOUT:\n%s\nSTDERR:\n%s", r.returncode, r.stdout, r.stderr)
-    else:
-        logger.info("Playwright browsers installed.")
-
-
-async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
-    browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-    context = await browser.new_context(
-        viewport={"width": 1440, "height": 900},
-        locale="ru-RU",
-        timezone_id="Europe/Moscow",
-        user_agent=UA,
-    )
-    page = await context.new_page()
-    await page.goto(TRADING_PAGE_URL, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_timeout(1500)
-    return browser, context, page
-
-
-async def fetch_window_playwright(page: Page) -> List[Dict[str, Any]]:
-    # Запрос к API из браузера (часто проходит, когда чистый httpx блокируют)
-    resp = await page.request.get(TRADES_URL, headers=HEADERS)
-    status = resp.status
-    body = await resp.text()
-    ct = (resp.headers.get("content-type") or "").lower()
-
-    if status >= 400:
-        raise RuntimeError(f"PW HTTP {status}; ct={ct}; body={body[:200]!r}")
-    if "application/json" not in ct:
-        raise RuntimeError(f"PW non-JSON; ct={ct}; body={body[:200]!r}")
-
-    payload = json.loads(body)
-    raw = _extract_trades(payload)
-
-    out: List[Dict[str, Any]] = []
-    for obj in raw:
-        row = normalize_trade(obj)
-        if row:
-            out.append(row)
-
-    out.sort(key=lambda x: float(x.get("_ts", 0.0)))
-    return out
-
-
-async def safe_close(browser: Optional[Browser], context: Optional[BrowserContext], page: Optional[Page]) -> None:
-    try:
-        if page:
-            await page.close()
-    except Exception:
-        pass
-    try:
-        if context:
-            await context.close()
-    except Exception:
-        pass
-    try:
-        if browser:
-            await browser.close()
-    except Exception:
-        pass
 
 
 # ───────────────────────── WORKER LOOP ─────────────────────────
+
 async def worker() -> None:
     seen: Set[TradeKey] = set()
     seen_q: Deque[TradeKey] = deque(maxlen=SEEN_MAX)
 
     backoff = 2.0
     last_heartbeat = 0.0
-    non_json_streak = 0
+    last_success = 0.0
 
     async with httpx.AsyncClient(
         headers=HEADERS,
-        timeout=20,
+        timeout=15,
+        follow_redirects=True,
+        verify=certifi.where(),
+        trust_env=True,  # если на Render задашь прокси через env, httpx её подхватит
+    ) as api, httpx.AsyncClient(
+        timeout=30,
         follow_redirects=True,
         verify=certifi.where(),
         trust_env=True,
-    ) as client:
+    ) as sb:
 
-        # preload seen, чтобы после рестарта не слать дублей пачкой
-        pre = await preload_seen_from_supabase(client, preload_limit=1500)
-        for k in pre:
-            seen.add(k)
-            seen_q.append(k)
-        logger.info("Preloaded %d recent keys from Supabase | seen=%d", len(pre), len(seen))
+        while True:
+            t0 = time.time()
+            try:
+                window = await fetch_window(api)
 
-        async with async_playwright() as pw:
-            browser: Optional[Browser] = None
-            context: Optional[BrowserContext] = None
-            page: Optional[Page] = None
+                # API обычно отдаёт desc (новые сверху). Для записи в БД удобнее old->new:
+                new_rows: List[Dict[str, Any]] = []
+                for row, key in reversed(window):
+                    if key in seen:
+                        continue
+                    new_rows.append(row)
+                    seen.add(key)
+                    seen_q.append(key)
 
-            while True:
-                t0 = time.time()
-                try:
-                    # 1) основной: httpx
-                    window: List[Dict[str, Any]] = []
-                    use_pw = non_json_streak >= NON_JSON_BEFORE_FALLBACK
+                # если deque вытеснил элементы — иногда проще пересобрать set
+                if len(seen) > len(seen_q) + 200:
+                    seen = set(seen_q)
 
-                    if not use_pw:
-                        window = await fetch_window_httpx(client)
-                    else:
-                        if page is None:
-                            try:
-                                browser, context, page = await open_browser(pw)
-                            except Exception as e:
-                                # если браузер не установлен — ставим и повторяем
-                                playwright_install()
-                                browser, context, page = await open_browser(pw)
-                        window = await fetch_window_playwright(page)
+                if new_rows:
+                    last_success = time.time()
+                    logger.info("Parsed %d new trades. Newest=%s", len(new_rows), json.dumps(new_rows[-1], ensure_ascii=False))
+                    for batch in chunked(new_rows, UPSERT_BATCH):
+                        await supabase_upsert(sb, batch)
+                else:
+                    logger.info("No new trades.")
 
-                    # если дошли сюда — значит JSON норм
-                    non_json_streak = 0
-                    backoff = 2.0
+                now = time.time()
+                if now - last_heartbeat >= HEARTBEAT_SEC:
+                    ok_ago = int(now - last_success) if last_success else -1
+                    logger.info(
+                        "Heartbeat: alive | market=%s | poll=%.2fs | window=%d | seen=%d | last_ok=%ss",
+                        MARKET, POLL_SEC, len(window), len(seen), ok_ago
+                    )
+                    last_heartbeat = now
 
-                    if not window:
-                        logger.warning("Empty window. url=%s", TRADES_URL)
-                    else:
-                        new_rows: List[Dict[str, Any]] = []
-                        # вставляем старые -> новые
-                        for row in window:
-                            k = make_key(row)
-                            if k in seen:
-                                continue
-                            new_rows.append(row)
-                            seen.add(k)
-                            seen_q.append(k)
+                backoff = 2.0
 
-                        # если set разъехался — пересоберём
-                        if len(seen) > len(seen_q) + 500:
-                            seen = set(seen_q)
+            except Exception as e:
+                logger.error("Worker error: %s", e)
+                logger.info("Retrying after %.1fs ...", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(60.0, backoff * 2)
 
-                        if new_rows:
-                            newest_clean = {k: v for k, v in new_rows[-1].items() if not k.startswith("_")}
-                            logger.info("Parsed %d new trades. Newest: %s", len(new_rows), json.dumps(newest_clean, ensure_ascii=False))
-                            for batch in chunked(new_rows, UPSERT_BATCH):
-                                await supabase_upsert(client, batch)
-                        else:
-                            logger.info("No new trades.")
-
-                    now = time.time()
-                    if now - last_heartbeat >= HEARTBEAT_SEC:
-                        logger.info(
-                            "Heartbeat: alive | market=%s | poll=%.2fs | seen=%d | mode=%s",
-                            MARKET, POLL_SEC, len(seen), ("playwright" if use_pw else "httpx"),
-                        )
-                        last_heartbeat = now
-
-                    # sleep with jitter
-                    dt = time.time() - t0
-                    sleep_s = max(0.3, POLL_SEC - dt + random.uniform(-0.15, 0.15))
-                    await asyncio.sleep(sleep_s)
-
-                except Exception as e:
-                    msg = str(e)
-                    # считаем "не JSON / блокировки" как повод включить fallback
-                    if "Non-JSON" in msg or "JSON decode failed" in msg or "403" in msg or "429" in msg:
-                        non_json_streak += 1
-                        logger.error("Fetch error (streak=%d): %s", non_json_streak, msg)
-                    else:
-                        logger.error("Worker error: %s", msg)
-
-                    # если в playwright-режиме упали — перезапустим браузер
-                    if page is not None:
-                        await safe_close(browser, context, page)
-                        browser = context = page = None
-
-                    logger.info("Retrying after %.1fs ...", backoff)
-                    await asyncio.sleep(backoff)
-                    backoff = min(60.0, backoff * 2)
+            # выдерживаем частоту опроса
+            dt = time.time() - t0
+            sleep_s = max(0.3, POLL_SEC - dt)
+            await asyncio.sleep(sleep_s)
 
 
 def main() -> None:
