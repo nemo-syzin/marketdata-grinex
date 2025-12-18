@@ -2,13 +2,12 @@ import asyncio
 import json
 import logging
 import os
-import re
+import random
 import time
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import certifi
 import httpx
@@ -22,77 +21,67 @@ except Exception:
 # ───────────────────────── CONFIG ─────────────────────────
 
 GRINEX_BASE_URL = os.getenv("GRINEX_BASE_URL", "https://grinex.io").rstrip("/")
-GRINEX_TRADES_PATH = os.getenv("GRINEX_TRADES_PATH", "/api/v2/trades")
 GRINEX_MARKET = os.getenv("GRINEX_MARKET", "usdta7a5")
 GRINEX_LIMIT = int(os.getenv("GRINEX_LIMIT", "200"))
-GRINEX_ORDER_BY = os.getenv("GRINEX_ORDER_BY", "desc")
-GRINEX_POLL_SECONDS = float(os.getenv("GRINEX_POLL_SECONDS", "2.0"))
+GRINEX_POLL_SECONDS = float(os.getenv("GRINEX_POLL_SECONDS", "1.5"))
+
+# Если Grinex режет Render — укажи прокси (например, http://user:pass@host:port)
+GRINEX_PROXY = os.getenv("GRINEX_PROXY", "").strip()
 
 SOURCE = os.getenv("SOURCE", "grinex")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 ON_CONFLICT = os.getenv("ON_CONFLICT", "source,symbol,trade_time,price,volume_usdt")
 
-UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "500"))
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
-
+UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "500"))
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "30"))
-SHOW_EMPTY_EVERY_SEC = int(os.getenv("SHOW_EMPTY_EVERY_SEC", "60"))
 
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
-TRUST_ENV = os.getenv("TRUST_ENV", "1") == "1"  # чтобы HTTP(S)_PROXY работал, если ты задашь его в Render
-
-UA = os.getenv(
-    "UA",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-)
+# ВАЖНО: endpoint как у твоей локальной версии
+TRADES_URL = f"{GRINEX_BASE_URL}/api/v2/trades?market={GRINEX_MARKET}&limit={GRINEX_LIMIT}&order_by=desc"
 
 HEADERS = {
-    "User-Agent": UA,
+    "User-Agent": os.getenv(
+        "UA",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": f"{GRINEX_BASE_URL}/trading/{GRINEX_MARKET}?lang=ru",
 }
 
-Q8 = Decimal("0.00000001")
-
-TRADES_URL = f"{GRINEX_BASE_URL}{GRINEX_TRADES_PATH}"
-
-# meta refresh (noscript) — типично: content="0; url=/abcdef"
-META_REFRESH_RE = re.compile(r'http-equiv=["\']refresh["\'][^>]*content=["\'][^;]+;\s*url=([^"\']+)["\']', re.I)
-# иногда встречается просто url=/path в html
-URL_FALLBACK_RE = re.compile(r'url=([^"\'>\s]+)', re.I)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
 logger = logging.getLogger("grinex-worker")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+Q8 = Decimal("0.00000001")
 
 
 # ───────────────────────── TYPES ─────────────────────────
 
 @dataclass(frozen=True)
-class TradeKey:
+class SeenKey:
+    # локальная дедупликация (не заменяет ON_CONFLICT в БД)
     tid: Optional[str]
     trade_time: str
     price: str
     volume_usdt: str
 
 
-def _tzinfo() -> timezone:
+# ───────────────────────── HELPERS ─────────────────────────
+
+def _tzinfo():
     if ZoneInfo is None:
         return timezone.utc
     try:
-        return ZoneInfo(TIMEZONE_NAME)  # type: ignore
+        return ZoneInfo(TIMEZONE)  # type: ignore
     except Exception:
         return timezone.utc
 
@@ -100,13 +89,11 @@ def _tzinfo() -> timezone:
 TZ = _tzinfo()
 
 
-# ───────────────────────── HELPERS ─────────────────────────
-
 def _as_decimal(x: Any) -> Optional[Decimal]:
     try:
         if x is None:
             return None
-        s = str(x).strip().replace("\xa0", " ").replace(" ", "").replace(",", ".")
+        s = str(x).strip().replace(",", ".").replace(" ", "")
         if not s:
             return None
         return Decimal(s)
@@ -163,10 +150,6 @@ def _parse_ts(obj: Dict[str, Any]) -> datetime:
 
 
 def normalize_trade(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Приводим к схеме exchange_trades:
-      source, symbol, price, volume_usdt, volume_rub, trade_time
-    """
     price = _as_decimal(obj.get("price"))
     amount = _as_decimal(obj.get("amount")) or _as_decimal(obj.get("volume"))
     total = _as_decimal(obj.get("total")) or _as_decimal(obj.get("funds")) or _as_decimal(obj.get("quote_volume"))
@@ -181,21 +164,21 @@ def normalize_trade(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     ts_utc = _parse_ts(obj)
     local = ts_utc.astimezone(TZ)
-    trade_time = local.strftime("%H:%M:%S")  # как у Rapira
+    trade_time = local.strftime("%H:%M:%S")  # как у Rapira: time without tz
 
     return {
         "source": SOURCE,
         "symbol": SYMBOL,
         "price": q8_str(price),
         "volume_usdt": q8_str(amount),
-        "volume_rub": q8_str(total),
+        "volume_rub": q8_str(total),   # в твоей таблице volume_rub NOT NULL
         "trade_time": trade_time,
-        "_tid": _get_tid(obj),  # внутреннее поле для seen
+        "_tid": _get_tid(obj),         # внутреннее поле
     }
 
 
-def make_key(row: Dict[str, Any]) -> TradeKey:
-    return TradeKey(
+def make_seen_key(row: Dict[str, Any]) -> SeenKey:
+    return SeenKey(
         tid=row.get("_tid"),
         trade_time=row["trade_time"],
         price=row["price"],
@@ -203,72 +186,29 @@ def make_key(row: Dict[str, Any]) -> TradeKey:
     )
 
 
-def chunked(xs: List[Dict[str, Any]], n: int) -> List[List[Dict[str, Any]]]:
+def chunked(rows: List[Dict[str, Any]], n: int) -> List[List[Dict[str, Any]]]:
     if n <= 0:
-        return [xs]
-    return [xs[i:i + n] for i in range(0, len(xs), n)]
+        return [rows]
+    return [rows[i:i + n] for i in range(0, len(rows), n)]
 
 
-# ───────────────────────── GRINEX FETCH (NO PLAYWRIGHT) ─────────────────────────
+class NonJsonFromGrinex(RuntimeError):
+    pass
 
-async def _noscript_handshake_if_needed(client: httpx.AsyncClient, html: str) -> bool:
-    """
-    Пытаемся пройти “noscript meta refresh” (получить cookie) и вернуть True, если сделали попытку.
-    Это не гарантирует успех, но часто превращает HTML → JSON на следующем запросе.
-    """
-    m = META_REFRESH_RE.search(html)
-    if not m:
-        m2 = URL_FALLBACK_RE.search(html)
-        if not m2:
-            return False
-        path = m2.group(1)
-    else:
-        path = m.group(1)
 
-    if not path.startswith("/"):
-        # иногда бывает относительный/странный — нормализуем
-        if path.startswith("http"):
-            url = path
-        else:
-            url = f"{GRINEX_BASE_URL}/{path.lstrip('/')}"
-    else:
-        url = f"{GRINEX_BASE_URL}{path}"
-
-    logger.warning("Grinex returned HTML, trying noscript handshake: GET %s", url)
-    try:
-        r = await client.get(url)
-        logger.info("Handshake response: HTTP %s | ct=%s", r.status_code, r.headers.get("content-type", ""))
-    except Exception as e:
-        logger.warning("Handshake failed: %s", e)
-    return True
-
+# ───────────────────────── NETWORK ─────────────────────────
 
 async def fetch_window(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    params = {"market": GRINEX_MARKET, "limit": str(GRINEX_LIMIT), "order_by": GRINEX_ORDER_BY}
-
-    r = await client.get(TRADES_URL, params=params)
+    r = await client.get(TRADES_URL)
     ct = (r.headers.get("content-type") or "").lower()
-    body = r.text or ""
 
-    # Если вдруг снова HTML — логируем и пробуем handshake + повтор
+    # На Render Grinex часто возвращает HTML-страницу защиты (как у тебя в логах)
     if "application/json" not in ct:
-        snippet = body[:400].replace("\n", "\\n")
-        logger.warning("Non-JSON response from Grinex | HTTP %s | ct=%s | body=%s", r.status_code, ct, snippet)
+        body = (r.text or "")[:600].replace("\n", "\\n")
+        logger.warning("Non-JSON response from Grinex | HTTP %s | ct=%s | body=%s", r.status_code, ct, body)
+        raise NonJsonFromGrinex(f"Grinex returned non-JSON ct={ct}")
 
-        did = await _noscript_handshake_if_needed(client, body)
-        if did:
-            # повторяем запрос 1 раз
-            r2 = await client.get(TRADES_URL, params=params)
-            ct2 = (r2.headers.get("content-type") or "").lower()
-            if "application/json" not in ct2:
-                snippet2 = (r2.text or "")[:400].replace("\n", "\\n")
-                raise RuntimeError(f"Still non-JSON from Grinex after handshake | ct={ct2} | body={snippet2}")
-            payload = r2.json()
-        else:
-            raise RuntimeError(f"Non-JSON from Grinex | ct={ct} | body={snippet}")
-    else:
-        payload = r.json()
-
+    payload = r.json()
     raw = _extract_trades(payload)
 
     out: List[Dict[str, Any]] = []
@@ -277,10 +217,9 @@ async def fetch_window(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
         if row:
             out.append(row)
 
+    # обычно new->old, но порядок нам важен на вставку: old->new сделаем позже
     return out
 
-
-# ───────────────────────── SUPABASE ─────────────────────────
 
 async def supabase_upsert(client: httpx.AsyncClient, rows: List[Dict[str, Any]]) -> None:
     if not rows:
@@ -307,70 +246,74 @@ async def supabase_upsert(client: httpx.AsyncClient, rows: List[Dict[str, Any]])
         logger.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(payload), SUPABASE_TABLE)
 
 
-# ───────────────────────── WORKER LOOP ─────────────────────────
+# ───────────────────────── WORKER ─────────────────────────
 
 async def worker() -> None:
-    seen: Set[TradeKey] = set()
-    seen_q: Deque[TradeKey] = deque(maxlen=SEEN_MAX)
-
+    seen: Set[SeenKey] = set()
     backoff = 2.0
-    last_heartbeat = 0.0
-    last_empty_log = 0.0
+    last_hb = 0.0
+
+    # Если задан GRINEX_PROXY — используем его.
+    # Иначе trust_env=True позволит взять HTTPS_PROXY/HTTP_PROXY из окружения Render.
+    proxy_arg = GRINEX_PROXY or None
 
     async with httpx.AsyncClient(
         headers=HEADERS,
-        timeout=HTTP_TIMEOUT,
+        timeout=15,
         follow_redirects=True,
         verify=certifi.where(),
-        trust_env=TRUST_ENV,
-        http2=False,  # иногда снижает “странные” ответы на некоторых хостингах
+        trust_env=True,
+        proxy=proxy_arg,
     ) as client:
         while True:
             t0 = time.time()
             try:
                 window = await fetch_window(client)
 
-                if window:
-                    # API обычно “новые сверху” → пишем старые→новые
-                    new_rows: List[Dict[str, Any]] = []
-                    for row in reversed(window):
-                        k = make_key(row)
-                        if k in seen:
-                            continue
-                        new_rows.append(row)
-                        seen.add(k)
-                        seen_q.append(k)
+                # old -> new
+                new_rows: List[Dict[str, Any]] = []
+                for row in reversed(window):
+                    k = make_seen_key(row)
+                    if k in seen:
+                        continue
+                    new_rows.append(row)
+                    seen.add(k)
+                    if len(seen) > SEEN_MAX:
+                        # простая “очистка”: оставляем ключи только из текущего окна
+                        seen = {make_seen_key(r) for r in window}
 
-                    # защита от рассинхрона
-                    if len(seen) > len(seen_q) + 200:
-                        seen = set(seen_q)
-
-                    if new_rows:
-                        newest = {k: v for k, v in new_rows[-1].items() if not k.startswith("_")}
-                        logger.info("Parsed %d new trades. Newest: %s", len(new_rows), json.dumps(newest, ensure_ascii=False))
-                        for batch in chunked(new_rows, UPSERT_BATCH):
-                            await supabase_upsert(client, batch)
-                    else:
-                        now = time.time()
-                        if now - last_empty_log >= SHOW_EMPTY_EVERY_SEC:
-                            logger.info("No new trades (market=%s).", GRINEX_MARKET)
-                            last_empty_log = now
+                if new_rows:
+                    newest = {k: v for k, v in new_rows[-1].items() if not k.startswith("_")}
+                    logger.info("Parsed %d new trades. Newest: %s", len(new_rows), json.dumps(newest, ensure_ascii=False))
+                    for batch in chunked(new_rows, UPSERT_BATCH):
+                        await supabase_upsert(client, batch)
                 else:
-                    logger.warning("Empty window from Grinex API (market=%s).", GRINEX_MARKET)
+                    # не спамим постоянно
+                    pass
 
-                # heartbeat
                 now = time.time()
-                if now - last_heartbeat >= HEARTBEAT_SEC:
+                if now - last_hb >= HEARTBEAT_SEC:
                     logger.info(
-                        "Heartbeat: alive | market=%s | poll=%.2fs | window=%d | seen=%d",
-                        GRINEX_MARKET, GRINEX_POLL_SECONDS, len(window), len(seen)
+                        "Heartbeat: alive | market=%s | poll=%.2fs | url=%s | window=%d | seen=%d | proxy=%s",
+                        GRINEX_MARKET, GRINEX_POLL_SECONDS, TRADES_URL, len(window), len(seen), "yes" if (GRINEX_PROXY or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")) else "no"
                     )
-                    last_heartbeat = now
+                    last_hb = now
 
                 backoff = 2.0
                 dt = time.time() - t0
-                sleep_s = max(0.3, GRINEX_POLL_SECONDS - dt)
-                await asyncio.sleep(sleep_s)
+                sleep_s = max(0.35, GRINEX_POLL_SECONDS - dt)
+                sleep_s += random.uniform(-0.10, 0.10)
+                await asyncio.sleep(max(0.25, sleep_s))
+
+            except NonJsonFromGrinex:
+                # это ровно твоя проблема на Render: HTML вместо JSON
+                logger.error(
+                    "BLOCKED: Grinex is returning HTML instead of JSON from this host/IP. "
+                    "Without Playwright, fix is: run on another host/IP or set GRINEX_PROXY/HTTPS_PROXY."
+                )
+                logger.info("Retrying after %.1fs ...", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(60.0, backoff * 2)
 
             except Exception as e:
                 logger.error("Worker error: %s", e)
